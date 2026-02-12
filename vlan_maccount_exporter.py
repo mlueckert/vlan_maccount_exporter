@@ -2,15 +2,15 @@
 """
 This script retrieves VLAN and MAC address information from network switches using SNMP (Simple Network Management Protocol).
 It is designed to filter VLANs by their IDs using a regular expression and output the count of MAC addresses per VLAN in 
-Prometheus format. 
+Prometheus format. Device queries are executed in parallel for improved performance when querying multiple switches.
 
 The script performs the following steps:
 1. Parses command-line arguments for configuration options.
 2. Configures logging to a rotating log file.
-3. Queries each specified switch for a list of VLANs.
+3. Queries each specified switch in parallel for a list of VLANs.
 4. Filters VLANs based on the provided regular expression.
 5. Retrieves the count of MAC addresses for each VLAN.
-6. Outputs the results in Prometheus format.
+6. Outputs the results in Prometheus format as queries complete.
 
 Usage:
     python script.py --hostnames <hostname1> <hostname2> ... --community <community> [options]
@@ -21,17 +21,18 @@ Command-Line Arguments:
     --hostnames: List of hostnames or IP addresses of switches to query (required).
     --community: SNMP v2c community string for authentication (default: "public", required).
     --debug: Enables debug logging.
+    --max_workers: Maximum number of parallel workers for device queries (default: 10).
 
 Logging:
     The script logs its operations to a rotating log file, with a maximum size of 5MB and up to 5 backup files. 
-    Debug logging can be enabled via the `--debug` argument.
+    Debug logging can be enabled via the `--debug` argument. Parallel execution status is logged at startup.
 
 Output:
     The script outputs the MAC address count for each VLAN in Prometheus format:
     vlan_mac_count{vlan="<VLAN_ID>",hostname="<HOSTNAME>"} <COUNT>
     It also outputs a status indicator:
-    vlan_maccount_exporter_status 0
-    If an error occurs, it logs the error details and outputs the status indicator.
+    vlan_maccount_exporter_status 1
+    If an error occurs, it logs the error details and outputs status 0.
 
 Functions:
     get_vlans(hostname, community):
@@ -40,9 +41,13 @@ Functions:
     get_mac_addresses(vlan, hostname, community):
         Retrieves the number of MAC addresses for a specific VLAN.
 
+    query_hostname(hostname, community, vlan_id_filter):
+        Queries a single hostname for all VLAN and MAC address information. Returns results in a dictionary format.
+        This function is executed in parallel by ThreadPoolExecutor for multiple devices.
+
     main(arguments):
-        Parses command-line arguments, configures logging, retrieves VLAN and MAC address information, and outputs the data 
-        in Prometheus format.
+        Parses command-line arguments, configures logging and ThreadPoolExecutor, and retrieves VLAN and MAC address 
+        information from multiple devices in parallel. Outputs results in Prometheus format as queries complete.
 """
 
 import argparse
@@ -52,6 +57,7 @@ import subprocess
 import re
 from collections import defaultdict
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # OID for VLANs
 vlan_oid = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"
@@ -109,9 +115,35 @@ def get_mac_addresses(vlan, hostname, community):
         logging.error(f"Error getting MAC addresses for VLAN {vlan}: {e}")
         return -1
 
+def query_hostname(hostname, community, vlan_id_filter):
+    """
+    Queries a single hostname for VLAN and MAC address information.
+
+    Args:
+        hostname (str): The hostname or IP address of the switch.
+        community (str): The SNMP community string for authentication.
+        vlan_id_filter (str): Regular expression to filter VLAN IDs.
+
+    Returns:
+        dict: A dictionary mapping VLAN IDs to MAC counts, with hostname as key.
+    """
+    mac_count_by_vlan = defaultdict(int)
+    try:
+        vlans = get_vlans(hostname, community)
+        for vlan in vlans:
+            if re.match(vlan_id_filter, vlan):
+                mac_count = get_mac_addresses(vlan, hostname, community)
+                mac_count_by_vlan[vlan] = mac_count
+            else:
+                logging.debug(f"Filtering {vlan}")
+    except Exception as e:
+        logging.error(f"Error querying hostname {hostname}: {e}")
+    
+    return {hostname: dict(mac_count_by_vlan)}
+
 def main(arguments):
     """
-    Main function to parse arguments and initiate SNMP queries to retrieve VLAN and MAC address information.
+    Main function to parse arguments and initiate parallel SNMP queries to retrieve VLAN and MAC address information.
 
     Args:
         arguments (list): Command-line arguments.
@@ -140,12 +172,19 @@ def main(arguments):
         help="Set loglevel to debug.",
         action="store_true",
     )
+    parser.add_argument(
+        "--max_workers",
+        help="Maximum number of parallel workers (default: 10)",
+        type=int,
+        default=10,
+    )
     try:
         args = parser.parse_args(arguments)
         log_fullpath = args.log_fullpath
         vlan_id_filter = args.vlan_id_filter
         hostnames = args.hostnames
         community = args.community
+        max_workers = args.max_workers
         logformat = "%(asctime)s:%(levelname)s:%(funcName)s:%(message)s"
         handler = RotatingFileHandler(
             filename=log_fullpath, maxBytes=(5242880), backupCount=5, encoding="utf-8"
@@ -156,21 +195,28 @@ def main(arguments):
             for myhandler in logging.getLogger().handlers:
                 myhandler.setLevel(logging.DEBUG)
         logging.info("VLAN MAC Count Exporter starting")
-        for hostname in hostnames:
-            mac_count_by_vlan = defaultdict(int)
-            vlans = get_vlans(hostname, community)
-
-            for vlan in vlans:
-                if re.match(vlan_id_filter, vlan):
-                    mac_count = get_mac_addresses(vlan, hostname, community)
-                    mac_count_by_vlan[vlan] = mac_count
-                else:
-                    logging.debug(f"Filtering {vlan}")
-            # Output in Prometheus format
-            for vlan, count in mac_count_by_vlan.items():
-                print(
-                    f'vlan_mac_count{{vlan="{vlan}",hostname="{hostname.upper()}"}} {count}'
-                )
+        logging.info(f"Querying {len(hostnames)} hostnames with {max_workers} parallel workers")
+        
+        # Use ThreadPoolExecutor for parallel queries
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(query_hostname, hostname, community, vlan_id_filter): hostname
+                for hostname in hostnames
+            }
+            
+            # Process results as they complete
+            for future in as_completed(futures):
+                hostname = futures[future]
+                try:
+                    result = future.result()
+                    # result is {hostname: {vlan: count, ...}}
+                    for host, vlan_counts in result.items():
+                        for vlan, count in vlan_counts.items():
+                            print(
+                                f'vlan_mac_count{{vlan="{vlan}",hostname="{host.upper()}"}} {count}'
+                            )
+                except Exception as e:
+                    logging.error(f"Error processing results for {hostname}: {e}")
 
         print("vlan_maccount_exporter_status 1")
     except:
